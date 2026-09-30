@@ -106,7 +106,7 @@
    - honey:   Newtonian, very viscous
    - water:   Newtonian, thin
    ============================================================ */
-const BUILD = 'v2026.09.30-02.10';
+const BUILD = 'v2026.09.30-02.20';
 document.getElementById('ver').textContent = BUILD;
 
 const canvas = document.getElementById('sim');
@@ -680,14 +680,15 @@ window.addEventListener('resize', resize);
 function seed(){
   P.length = 0;
   const s = PR * 2.05;
-  const rows = Math.floor(Hh * 0.30 / (s * 0.9));
+  const cols = Math.max(1, Math.floor(W / s));
+  // target a consistent pool depth (~14 rows) at every width, capped by particle budget
+  const rows = Math.min(14, Math.floor(MAXP * 0.8 / cols));
   for (let r = 0; r < rows; r++){
     for (let x = s / 2; x < W; x += s){
       const px = x + (r % 2 ? s / 2 : 0) + (Math.random() - 0.5) * 2;
       const py = Hh - PR - r * s * 0.9;
       if (px < W - PR) addParticle(px, py, 'oobleck');
     }
-    if (P.length > MAXP * 0.55) break;
   }
 }
 
