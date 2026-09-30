@@ -106,7 +106,7 @@
    - honey:   Newtonian, very viscous
    - water:   Newtonian, thin
    ============================================================ */
-const BUILD = 'v2026.09.30-01.00';
+const BUILD = 'v2026.09.30-02.10';
 document.getElementById('ver').textContent = BUILD;
 
 const canvas = document.getElementById('sim');
@@ -114,11 +114,11 @@ const ctx = canvas.getContext('2d');
 const isMobile = matchMedia('(pointer: coarse)').matches || innerWidth < 768;
 
 // ---- tuning ------------------------------------------------
-const PR   = isMobile ? 5.0 : 4.2;     // particle radius (px)
+const PR   = isMobile ? 6.0 : 4.2;     // particle radius (px)
 const H    = PR * 4.0;                 // kernel radius
-const SUB  = 2;                        // substeps per frame
-const PBF_ITERS = 2;                   // density solver iterations
-const MAXP = isMobile ? 1500 : 2600;   // particle cap
+const SUB  = isMobile ? 1 : 2;         // substeps per frame
+const PBF_ITERS = isMobile ? 3 : 2;    // density solver iterations
+const MAXP = isMobile ? 900 : 2600;    // particle cap
 const GRAV = 1500;                     // px/s^2
 
 // ---- materials ---------------------------------------------
@@ -149,37 +149,26 @@ let clearArmed = false;
 // pointer
 const ptr = { x:0, y:0, vx:0, vy:0, down:false, lx:0, ly:0, t:0 };
 
-// spatial hash
-const grid = new Map();
+// spatial hash: flat head/next arrays, zero allocation per step
+const GHASH = 2048, GMASK = GHASH - 1;
 const CELL = H;
-function gkey(cx, cy){ return cx * 73856093 ^ cy * 19349663; }
+let gHead = new Int32Array(GHASH);
+let gNext = new Int32Array(1024);
 function buildGrid(){
-  grid.clear();
-  for (let i = 0; i < P.length; i++){
+  const n = P.length;
+  if (gNext.length < n) gNext = new Int32Array(n + 512);
+  gHead.fill(-1);
+  for (let i = 0; i < n; i++){
     const p = P[i];
-    const k = gkey(Math.floor(p.px / CELL), Math.floor(p.py / CELL));
-    let a = grid.get(k);
-    if (!a){ a = []; grid.set(k, a); }
-    a.push(i);
+    const hsh = ((Math.floor(p.px / CELL) * 73856093) ^ (Math.floor(p.py / CELL) * 19349663)) & GMASK;
+    gNext[i] = gHead[hsh];
+    gHead[hsh] = i;
   }
 }
-function eachNeighbor(i, fn){
-  const p = P[i];
-  const cx = Math.floor(p.px / CELL), cy = Math.floor(p.py / CELL);
-  const H2 = H * H;
-  for (let gx = cx - 1; gx <= cx + 1; gx++)
-    for (let gy = cy - 1; gy <= cy + 1; gy++){
-      const a = grid.get(gkey(gx, gy));
-      if (!a) continue;
-      for (let n = 0; n < a.length; n++){
-        const j = a[n];
-        if (j === i) continue;
-        const q = P[j];
-        const dx = q.px - p.px, dy = q.py - p.py;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < H2 && d2 > 1e-6) fn(j, Math.sqrt(d2), dx, dy);
-      }
-    }
+// scratch velocity buffers (reused, not reallocated)
+let SX = new Float32Array(1024), SY = new Float32Array(1024);
+function ensureScratch(n){
+  if (SX.length < n){ SX = new Float32Array(n + 512); SY = new Float32Array(n + 512); }
 }
 
 // ---- kernels (2D-adapted poly6 / spiky) ----------------------
@@ -229,7 +218,7 @@ function rheology(mat, shear){
 
 function addParticle(x, y, mat, vx, vy){
   if (P.length >= MAXP) P.shift();
-  P.push({ x, y, px:x, py:y, vx:vx || 0, vy:vy || 0, mat, shear:0, lamb:0 });
+  P.push({ x, y, px:x, py:y, vx:vx || 0, vy:vy || 0, mat, shear:0, lamb:0, stress:0, jam:0 });
 }
 
 function step(dt){
@@ -239,43 +228,72 @@ function step(dt){
 
 function substep(h){
   const n = P.length;
+  if (n === 0){ if (ball) collideBall(h); return; }
+  ensureScratch(n);
   // --- 1. external forces + predict ---
   for (let i = 0; i < n; i++){
     const p = P[i];
     p.vx += gravX * h;
     p.vy += gravY * h;
-    // gentle global damping
     p.vx *= 0.999; p.vy *= 0.999;
     p.px = p.x + p.vx * h;
     p.py = p.y + p.vy * h;
   }
   buildGrid();
+  const H2 = H * H, W0 = wPoly(0);
   // --- 2. PBF density constraint ---
   for (let it = 0; it < PBF_ITERS; it++){
-    for (let i = 0; i < n; i++){
+    for (let i = 0; i < n; i++){           // lambdas (rho + grad in one walk)
       const p = P[i];
-      let rho = 0;
-      eachNeighbor(i, (j, r) => { rho += wPoly(r); });
-      rho += wPoly(0); // self
-      const C = rho / REST_D - 1;
-      let gradSum = 0, gradPi = 0;
-      eachNeighbor(i, (j, r, dx, dy) => {
-        const g = SPIKY * (H - r) * (H - r) / (r * REST_D);
-        const gx = -g * dx, gy = -g * dy;
-        gradSum += gx * gx + gy * gy;
-        gradPi  += gx * gx + gy * gy;
-      });
-      p.lamb = -C / (gradSum + gradPi + 1e3);
+      let rho = W0, gs = 0;
+      const cx = Math.floor(p.px / CELL), cy = Math.floor(p.py / CELL);
+      for (let gx = cx - 1; gx <= cx + 1; gx++){
+        const hx = gx * 73856093;
+        for (let gy = cy - 1; gy <= cy + 1; gy++){
+          let j = gHead[(hx ^ (gy * 19349663)) & GMASK];
+          while (j !== -1){
+            if (j !== i){
+              const q = P[j];
+              const dx = q.px - p.px, dy = q.py - p.py;
+              const d2 = dx * dx + dy * dy;
+              if (d2 < H2 && d2 > 1e-6){
+                const r = Math.sqrt(d2), hd = H - r;
+                rho += wPoly(r);
+                const g = SPIKY * hd * hd / (r * REST_D);
+                const gx2 = -g * dx, gy2 = -g * dy;
+                gs += gx2 * gx2 + gy2 * gy2;
+              }
+            }
+            j = gNext[j];
+          }
+        }
+      }
+      p.lamb = -(rho / REST_D - 1) / (2 * gs + 1e-2);
     }
-    for (let i = 0; i < n; i++){
-      const p = P[i];
+    for (let i = 0; i < n; i++){           // position corrections
+      const p = P[i], li = p.lamb;
       let dx = 0, dy = 0;
-      eachNeighbor(i, (j, r, ddx, ddy) => {
-        const q = P[j];
-        const g = SPIKY * (H - r) * (H - r) / (r * REST_D);
-        const s = p.lamb + q.lamb;
-        dx += s * (-g * ddx); dy += s * (-g * ddy);
-      });
+      const cx = Math.floor(p.px / CELL), cy = Math.floor(p.py / CELL);
+      for (let gx = cx - 1; gx <= cx + 1; gx++){
+        const hx = gx * 73856093;
+        for (let gy = cy - 1; gy <= cy + 1; gy++){
+          let j = gHead[(hx ^ (gy * 19349663)) & GMASK];
+          while (j !== -1){
+            if (j !== i){
+              const q = P[j];
+              const ddx = q.px - p.px, ddy = q.py - p.py;
+              const d2 = ddx * ddx + ddy * ddy;
+              if (d2 < H2 && d2 > 1e-6){
+                const r = Math.sqrt(d2), hd = H - r;
+                const g = SPIKY * hd * hd / (r * REST_D);
+                const s = li + q.lamb;
+                dx += s * (g * ddx); dy += s * (g * ddy); // (λi+λj)·∇W(pi−pj)
+              }
+            }
+            j = gNext[j];
+          }
+        }
+      }
       p.px += dx; p.py += dy;
     }
   }
@@ -285,54 +303,72 @@ function substep(h){
     p.vx = (p.px - p.x) / h;
     p.vy = (p.py - p.y) / h;
     p.x = p.px; p.y = p.py;
+    if (p.jam > 0.004) p.jam *= 0.95; else p.jam = 0; // impact-jam memory
   }
-  // --- 4. rheology: shear rate + XSPH viscosity ---
+  // --- 4. rheology: shear rate + XSPH viscosity in ONE neighbor walk ---
   for (let i = 0; i < n; i++){
-    const p = P[i];
-    let sw = 0, wsum = 0;
-    eachNeighbor(i, (j, r) => {
-      const q = P[j];
-      const dvx = p.vx - q.vx, dvy = p.vy - q.vy;
-      const w = H - r;
-      sw += Math.sqrt(dvx * dvx + dvy * dvy) * w;
-      wsum += w;
-    });
-    p.shear = wsum > 0 ? sw / wsum : 0;
-  }
-  const nvx = new Float32Array(n), nvy = new Float32Array(n);
-  for (let i = 0; i < n; i++){
-    const p = P[i];
-    const rh = rheology(p.mat, p.shear);
+    const p = P[i], pvx = p.vx, pvy = p.vy;
+    let sw = 0, wsum = 0, sx = 0, sy = 0;
+    const cx = Math.floor(p.px / CELL), cy = Math.floor(p.py / CELL);
+    for (let gx = cx - 1; gx <= cx + 1; gx++){
+      const hx = gx * 73856093;
+      for (let gy = cy - 1; gy <= cy + 1; gy++){
+        let j = gHead[(hx ^ (gy * 19349663)) & GMASK];
+        while (j !== -1){
+          if (j !== i){
+            const q = P[j];
+            const dx = q.px - p.px, dy = q.py - p.py;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < H2 && d2 > 1e-6){
+              const w = H - Math.sqrt(d2);
+              const dvx = pvx - q.vx, dvy = pvy - q.vy;
+              sw += Math.sqrt(dvx * dvx + dvy * dvy) * w;
+              sx += (q.vx - pvx) * w; sy += (q.vy - pvy) * w;
+              wsum += w;
+            }
+          }
+          j = gNext[j];
+        }
+      }
+    }
+    const shear = wsum > 0 ? sw / wsum : 0;
+    p.shear = shear;
+    const rh = rheology(p.mat, shear);
     p.stress = rh.stress;
-    let sx = 0, sy = 0, wsum = 0;
-    eachNeighbor(i, (j, r) => {
-      const q = P[j];
-      const w = H - r;
-      sx += (q.vx - p.vx) * w; sy += (q.vy - p.vy) * w;
-      wsum += w;
-    });
-    if (wsum > 0){
-      nvx[i] = p.vx + rh.xsph * sx / wsum;
-      nvy[i] = p.vy + rh.xsph * sy / wsum;
-    } else { nvx[i] = p.vx; nvy[i] = p.vy; }
+    if (wsum > 0){ SX[i] = pvx + rh.xsph * sx / wsum; SY[i] = pvy + rh.xsph * sy / wsum; }
+    else { SX[i] = pvx; SY[i] = pvy; }
   }
-  for (let i = 0; i < n; i++){ P[i].vx = nvx[i]; P[i].vy = nvy[i]; }
+  for (let i = 0; i < n; i++){ P[i].vx = SX[i]; P[i].vy = SY[i]; }
   // --- 5. slime viscoelastic springs (stretchy, snaps back) ---
-  const RESTL = PR * 2.1, BREAKL = PR * 5.2;
+  const RESTL = PR * 2.1, BREAKL = PR * 5.2, BREAK2 = BREAKL * BREAKL;
   for (let i = 0; i < n; i++){
     const p = P[i];
     if (p.mat !== 'slime') continue;
-    eachNeighbor(i, (j, r, dx, dy) => {
-      const q = P[j];
-      if (q.mat !== 'slime' || j < i) return;
-      if (r > BREAKL) return;
-      const stiff = r > RESTL * 1.6 ? 0.34 : 0.16; // strain-hardening
-      const corr = (r - RESTL) * stiff * 0.5;
-      const ux = dx / r, uy = dy / r;
-      p.x -= ux * corr; p.y -= uy * corr;
-      q.x += ux * corr; q.y += uy * corr;
-      p.px = p.x; p.py = p.y; q.px = q.x; q.py = q.y;
-    });
+    const cx = Math.floor(p.px / CELL), cy = Math.floor(p.py / CELL);
+    for (let gx = cx - 1; gx <= cx + 1; gx++){
+      const hx = gx * 73856093;
+      for (let gy = cy - 1; gy <= cy + 1; gy++){
+        let j = gHead[(hx ^ (gy * 19349663)) & GMASK];
+        while (j !== -1){
+          if (j > i){
+            const q = P[j];
+            if (q.mat === 'slime'){
+              const dx = q.px - p.px, dy = q.py - p.py;
+              const d2 = dx * dx + dy * dy;
+              if (d2 < BREAK2 && d2 > 1e-6){
+                const r = Math.sqrt(d2);
+                const stiff = r > RESTL * 1.6 ? 0.34 : 0.16; // strain-hardening
+                const corr = (r - RESTL) * stiff * 0.5 / r;
+                const ox = dx * corr, oy = dy * corr;
+                p.x -= ox; p.y -= oy; q.x += ox; q.y += oy;
+                p.px = p.x; p.py = p.y; q.px = q.x; q.py = q.y;
+              }
+            }
+          }
+          j = gNext[j];
+        }
+      }
+    }
   }
   // --- 6. boundaries ---
   collideBounds();
@@ -353,29 +389,44 @@ function collideBounds(){
 // heavy ball, two-way coupled: shoves particles, particles push back
 function collideBall(h){
   const b = ball, rr = b.r + PR;
+  if (!b) return;
   // ball vs walls
   if (b.x < b.r){ b.x = b.r; b.vx = Math.abs(b.vx) * 0.4; }
   if (b.x > W - b.r){ b.x = W - b.r; b.vx = -Math.abs(b.vx) * 0.4; }
   if (b.y > Hh - b.r){ b.y = Hh - b.r; b.vy = -Math.abs(b.vy) * 0.35; b.vx *= 0.98; }
   if (b.y < b.r){ b.y = b.r; b.vy = Math.abs(b.vy) * 0.4; }
   b.vy += gravY * h;
-  // impulse contacts: each particle's effective mass grows when jammed
-  // (oobleck stress -> 1+40*stress). Jammed plug stops the ball; water parts.
+
+  const solid = []; // rigid-plug contact particle indices
+  let spx = 0, spy = 0, svx = 0, svy = 0;
+
   for (let i = 0; i < P.length; i++){
     const p = P[i];
     const dx = p.x - b.x, dy = p.y - b.y;
     const d2 = dx * dx + dy * dy;
-    if (d2 < rr * rr && d2 > 1e-4){
-      const d = Math.sqrt(d2), nx = dx / d, ny = dy / d;
-      const push = (rr - d);
-      const mp = 1 + 40 * (p.stress || 0); // effective particle mass
+    if (d2 >= rr * rr || d2 < 1e-4) continue;
+    const d = Math.sqrt(d2), nx = dx / d, ny = dy / d, push = rr - d;
+    const vrel = (p.vx - b.vx) * nx + (p.vy - b.vy) * ny;
+    // oobleck jams on impact (sticky: stays jammed while being hit)
+    if (vrel < 0 && p.mat === 'oobleck'){
+      const jt = Math.min(1, -vrel / 500), jam = jt * jt * (3 - 2 * jt);
+      if (jam > (p.jam || 0)) p.jam = jam;
+    }
+    const seff = Math.max(p.stress || 0, p.jam || 0);
+    if (seff > 0.45){
+      // jammed plug: acts as one rigid solid against the ball
+      solid.push(i); spx += p.x; spy += p.y; svx += p.vx; svy += p.vy;
+      p.x += nx * push * 0.15; p.y += ny * push * 0.15; // dent looks soft
+      p.px = p.x; p.py = p.y;
+    } else {
+      // fluid contact: soft two-way coupling (water parts around the ball)
+      const mp = 1 + 40 * seff;
       const pShare = b.mass / (b.mass + mp), bShare = mp / (b.mass + mp);
       p.x += nx * push * pShare; p.y += ny * push * pShare;
       b.x -= nx * push * bShare; b.y -= ny * push * bShare;
       p.px = p.x; p.py = p.y;
-      const vrel = (p.vx - b.vx) * nx + (p.vy - b.vy) * ny;
       if (vrel < 0){
-        const e = 0.05 + 0.3 * (p.stress || 0); // jammed oobleck bounces a little
+        const e = 0.05 + 0.3 * seff;
         const jimp = -(1 + e) * vrel / (1 / mp + 1 / b.mass);
         p.vx += nx * jimp / mp; p.vy += ny * jimp / mp;
         b.vx -= nx * jimp / b.mass; b.vy -= ny * jimp / b.mass;
@@ -383,12 +434,44 @@ function collideBall(h){
       p.vx += b.vx * 0.02; p.vy += b.vy * 0.02; // contact friction
     }
   }
+
+  if (solid.length){
+    const n = solid.length;
+    const pvx = svx / n, pvy = svy / n;
+    let nx = spx / n - b.x, ny = spy / n - b.y; // contact normal: ball -> plug
+    const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+    // positional: eject the ball out of the rigid plug
+    let maxPen = 0;
+    for (const i of solid){
+      const p = P[i];
+      const pen = rr - Math.hypot(p.x - b.x, p.y - b.y);
+      if (pen > maxPen) maxPen = pen;
+    }
+    b.x -= nx * maxPen * 0.85; b.y -= ny * maxPen * 0.85;
+    // velocity: single aggregated bounce off the plug (no per-particle pileup)
+    const vrel = (b.vx - pvx) * nx + (b.vy - pvy) * ny; // > 0 = approaching
+    if (vrel > 0){
+      const dvn = -1.25 * vrel; // restitution 0.25
+      b.vx += nx * dvn; b.vy += ny * dvn;
+      const kick = -dvn * b.mass / (n * 200); // plug recoil splash (pushes plug away)
+      for (const i of solid){
+        const p = P[i];
+        p.vx += nx * kick; p.vy += ny * kick;
+      }
+    }
+  }
+
   b.vx *= 0.999; b.vy *= 0.999;
   b.x += b.vx * h; b.y += b.vy * h;
 }
 
 function dropBall(){
-  ball = { x: W / 2, y: 60, vx: 0, vy: 0, r: Math.min(W, Hh) * 0.075 + 14, mass: 900 };
+  if (ball) return;
+  let top = Hh;
+  for (const p of P) if (p.y < top) top = p.y;
+  if (top > Hh - 60) top = 220; // pool cleared: drop from mid-air
+  ball = { x: W / 2, y: Math.max(50, top - 150), vx: 0, vy: 0,
+           r: Math.min(W, Hh) * 0.075 + 14, mass: 900 };
   toast('🎱 dropped — oobleck turns solid under impact');
 }
 
@@ -571,7 +654,7 @@ function render(){
   for (let i = 0; i < P.length; i++){
     const p = P[i];
     let spr = sprites[p.mat];
-    if (p.mat === 'oobleck' && p.stress > 0.35) spr = sprites.oobleck_stress;
+    if (p.mat === 'oobleck' && Math.max(p.stress || 0, p.jam || 0) > 0.35) spr = sprites.oobleck_stress;
     ctx.drawImage(spr, p.x - S / 2, p.y - S / 2, S, S);
   }
   if (ball){
@@ -587,7 +670,7 @@ function render(){
 // ---- resize ---------------------------------------------------------
 function resize(){
   const r = stage.getBoundingClientRect();
-  DPR = Math.min(devicePixelRatio || 1, 2);
+  DPR = Math.min(devicePixelRatio || 1, isMobile ? 1.5 : 2);
   W = Math.max(200, r.width); Hh = Math.max(200, r.height);
   canvas.width = W * DPR; canvas.height = Hh * DPR;
 }
